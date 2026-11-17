@@ -138,7 +138,8 @@ class Store:
             for name,pic in views.items():
                 (folder/(name+'.png')).write_bytes(encode(pic))
             record={'id':rid,'revision':captured['revision'],'source':captured['source'],
-                    'settings':captured['settings'],'report':report,'created':time.time()}
+                    'settings':captured['settings'],'report':report,
+                    'views':sorted(views.keys()),'created':time.time()}
             (folder/'result.json').write_text(json.dumps(record,ensure_ascii=False,indent=2))
             current['results'].append(record)
             current['current_result']=rid

@@ -11,15 +11,25 @@ def export_plates(store,key,rid=None):
     record,folder=store.result(key,rid)
     stream=io.BytesIO()
     with zipfile.ZipFile(stream,'w',zipfile.ZIP_DEFLATED) as z:
+        # C/M/Y/K.png are the single shared trapped set: proof and saved
+        # projects are derived from these same compensated plates.
         for name in (*INKS,'proof','continuous','source'):
             z.writestr(name+'.png',(folder/(name+'.png')).read_bytes())
+        extras=[n for n in ('trap','proof-raw',*(i+'-raw' for i in INKS))
+                if (folder/(n+'.png')).exists()]
+        for name in extras:
+            z.writestr(name+'.png',(folder/(name+'.png')).read_bytes())
+        trap=record.get('report',{}).get('trap')
         manifest={'format':'dotpress-plates-1','result':record,
                   'plate_convention':'black=ink, white=paper; separate grayscale C M Y K',
+                  'trapping':'C/M/Y/K plates include the directional spread trap at trap_mm; *-raw and proof-raw are the uncompensated plates; trap.png marks the added bands',
                   'proof':'approximate subtractive RGB simulation, not an ICC press contract proof',
                   'coordinates':'physical page top-left, mm; positive x right and y down',
                   'pixel_centers':'(column+.5,row+.5)*25.4/dpi'}
+        if trap:
+            manifest['trap_report']=trap
         z.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
-        z.writestr('README.txt','DotPress合成演示。四独立灰度印版与RGB软打样。尺寸/DPI/网线和原输入修订见manifest。\n')
+        z.writestr('README.txt','DotPress合成演示。四独立灰度印版与RGB软打样。陷印为浅色墨版向深色邻接墨版的定向搭接，纸面与字孔不扩张；-raw为未补偿版，trap为改动带。尺寸/DPI/网线和原输入修订见manifest。\n')
     return stream.getvalue()
 
 

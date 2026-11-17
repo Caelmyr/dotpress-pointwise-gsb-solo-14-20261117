@@ -4,19 +4,25 @@ import math
 import hashlib
 import numpy as np
 from PIL import Image, ImageOps
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import (map_coordinates,binary_dilation,binary_erosion,
+                           convolve)
 from image_lab.validation import Invalid
 
 INKS=('C','M','Y','K')
 DEFAULTS={
     'width_mm':100.,'height_mm':75.,'dpi':96.,'lpi':18.,
     'black':.7,'ink_limit':2.8,'gamma':1.,'saturation':1.,
-    'paper':'#fff8e8','gain':.12,'proof_density':1.,
+    'paper':'#fff8e8','gain':.12,'proof_density':1.,'trap_mm':0.,
     'angles':[15.,75.,0.,45.],'phase_x':[0.,0.,0.,0.],
     'phase_y':[0.,0.,0.,0.],'offset_x':[0.,0.,0.,0.],
     'offset_y':[0.,0.,0.,0.],'enabled':[True,True,True,True],
     'crop':[0.,0.,1.,1.],'fit':'contain','screened':True,
 }
+# Neutral-density style ink weights fix the spread direction: Y<C<M<K,
+# so the lighter plate always grows into the darker neighbor.
+TRAP_DENSITY=np.array([.61,.93,.06,1.64])
+TRAP_COLORS=((0,150,175),(215,45,125),(245,205,25),(45,45,45))
+TRAP_EPS=1e-6
 
 def finite(value,label,low,high):
     try:
@@ -35,7 +41,8 @@ def settings(raw=None):
     p={**DEFAULTS,**raw}
     ranges={'width_mm':(10,300),'height_mm':(10,300),'dpi':(36,300),
             'lpi':(3,80),'black':(0,1),'ink_limit':(1,4),'gamma':(.2,4),
-            'saturation':(0,2),'gain':(-.3,.5),'proof_density':(.2,2.5)}
+            'saturation':(0,2),'gain':(-.3,.5),'proof_density':(.2,2.5),
+            'trap_mm':(0,2)}
     for key,(lo,hi) in ranges.items():
         p[key]=finite(p[key],key,lo,hi)
     for key in ('angles','phase_x','phase_y','offset_x','offset_y'):
@@ -193,6 +200,91 @@ def screen_plates(cmyk,p,origin=(0,0)):
     return np.stack(out,axis=2)
 
 
+def _disk(radius):
+    r=int(math.ceil(radius-1e-9))
+    yy,xx=np.mgrid[-r:r+1,-r:r+1]
+    return (xx*xx+yy*yy<=max(radius,.5)**2).astype(float)
+
+
+def trap_plates(plates,cmyk,p):
+    """Directional spread trap, width trap_mm in physical page units.
+
+    A lighter ink plate grows by the trap width into adjacent darker ink only;
+    plate edges meeting bare paper never spread, so counters (letter holes) and
+    paper white stay open. Dark solid components thinner than two trap widths
+    are treated as hairlines and refuse the trap, keeping thin strokes intact.
+    Geometry/direction tests use the continuous-tone separation (halftone dots
+    are disconnected and cannot describe feature thickness); radius is
+    mm*dpi/25.4, so a fixed trap width survives DPI changes.
+    Returns (trapped plates, per-ink added-band mask, spread-pixel matrix).
+    """
+    width=p['trap_mm']
+    binary=p['screened']
+    trapped=plates.copy()
+    h,w=plates.shape[:2]
+    added=np.zeros_like(plates)
+    spread=np.zeros((4,4),dtype=int)
+    if width<=0:
+        return trapped,added,spread
+    radius=width*p['dpi']/25.4
+    foot=_disk(radius)
+    solid=cmyk>=.5
+    any_solid=solid.any(axis=2)
+    # Pixels within the trap reach of bare paper cannot receive a trap:
+    # ink-to-paper edges are gaps against paper, not another ink, and the
+    # guard keeps enclosed letter counters open. Resampled paper has no solid
+    # channel, so the any_solid rule still admits genuine ink-to-ink seams.
+    paper_near=binary_dilation(~any_solid,structure=foot)
+    darkness=np.clip(cmyk@TRAP_DENSITY,0,None)
+    # Hairline guard: erode each solid ink by the trap radius and dilate the
+    # surviving core back. A stroke thinner than 2*radius loses its core and
+    # stays unmarked, so hairlines and thin text strokes refuse the trap;
+    # broad fields are restored edge-to-edge even when their anti-aliased
+    # seam strip itself is only a few pixels wide.
+    wide=np.stack([binary_dilation(binary_erosion(solid[:,:,j],structure=foot,
+                                                   border_value=0),structure=foot)
+                   for j in range(4)],axis=2)
+    for i in range(4):
+        if not p['enabled'][i]:
+            continue
+        source_ink=solid[:,:,i]
+        # Candidate band: growth reach of this plate, excluding its own ink,
+        # pixels with no solid neighbor ink, and pure-paper pixels. The
+        # any_solid rule keeps traps off bare paper even across anti-aliased
+        # boundaries, so enclosed paper counters (letter holes) never fill.
+        other_ink=np.delete(solid,i,axis=2).any(axis=2)
+        band=(binary_dilation(source_ink,structure=foot)&~source_ink
+              &any_solid&other_ink&~paper_near)
+        # Hairline guard: every solid ink under the band must be a wide feature.
+        allowed=np.delete(wide,i,axis=2).any(axis=2)
+        band&=allowed
+        # Lighter-into-darker: mean source-side darkness must sit below the
+        # darkness currently printed at the candidate pixel.
+        weight=cmyk[:,:,i]*source_ink
+        local_weight=convolve(weight,foot,mode='constant',cval=0)
+        src_dark=convolve(darkness*weight,foot,mode='constant',cval=0)/np.maximum(local_weight,1e-12)
+        band&=(src_dark+TRAP_EPS<darkness)
+        if binary:
+            trapped[band,i]=1.
+        else:
+            tone=convolve(plates[:,:,i]*source_ink,foot,mode='constant',cval=0)/np.maximum(local_weight,1e-12)
+            trapped[band,i]=np.maximum(trapped[band,i],np.clip(tone[band],0,1))
+        added[band,i]=1.
+        for j in range(4):
+            if j!=i:
+                spread[i,j]=int(np.count_nonzero(band&solid[:,:,j]))
+    return trapped,added,spread
+
+
+def trap_band(plates,added):
+    """RGB change map: gray original inks, process colors where each plate grew."""
+    base=(1-np.clip(plates.sum(axis=2),0,1)*.7)
+    view=np.repeat(base[:,:,None],3,axis=2)
+    for i in range(4):
+        view[added[:,:,i]>.5]=np.array(TRAP_COLORS[i],dtype=float)/255
+    return view
+
+
 def proof(plates,p):
     """Approximate subtractive RGB proof; no measured press profile claim."""
     paper=linear(parse_color(p['paper']))
@@ -211,12 +303,26 @@ def render(source,p):
     p=settings(p)
     rgb,alpha=source_canvas(source,p)
     cmyk=separate(rgb,p)
-    plates=screen_plates(cmyk,p)
-    views={'source':image(rgb),'proof':image(proof(plates,p)),'continuous':image(proof(cmyk,p))}
+    raw=screen_plates(cmyk,p)
+    plates,added,spread=trap_plates(raw,cmyk,p)
+    views={'source':image(rgb),'proof':image(proof(plates,p)),
+           'continuous':image(proof(cmyk,p)),'proof-raw':image(proof(raw,p)),
+           'trap':image(trap_band(plates,added))}
     for i,name in enumerate(INKS):
         views[name]=image(1-plates[:,:,i])
+        views[name+'-raw']=image(1-raw[:,:,i])
         views[name+'-tone']=image(1-cmyk[:,:,i])
-    return views,{'nominal':cmyk,'plates':plates,'alpha':alpha}
+    return views,{'nominal':cmyk,'plates':plates,'raw':raw,'added':added,
+                  'spread':spread,'alpha':alpha}
+
+
+def trap_report(arrays,p):
+    added=arrays['added']
+    return {'trap_mm':p['trap_mm'],'radius_px':p['trap_mm']*p['dpi']/25.4,
+            'rule':'浅色墨版向相邻深色墨版搭接；不向纸面扩张；窄于两倍陷印宽度的细线拒绝搭接',
+            'added_pixels':{INKS[i]:int(np.count_nonzero(added[:,:,i])) for i in range(4)},
+            'spread':{INKS[i]:{INKS[j]:int(arrays['spread'][i,j]) for j in range(4) if j!=i}
+                      for i in range(4)}}
 
 
 def statistics(arrays,p):
@@ -234,6 +340,7 @@ def statistics(arrays,p):
         report['channels'][name]={'mean_tone':float(tone.mean()),'area_coverage':float(plate.mean()),
                                  'min':float(tone.min()),'max':float(tone.max()),
                                  'histogram':np.histogram(tone,bins=16,range=(0,1))[0].tolist()}
+    report['trap']=trap_report(arrays,p)
     return report
 
 

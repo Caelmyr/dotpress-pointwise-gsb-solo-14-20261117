@@ -64,10 +64,15 @@ def install(app,root):
 
     @api.get('/projects/<key>/result/<channel>.png')
     def result_image(key,channel):
-        if channel not in ('source','proof','continuous',*INKS,*[i+'-tone' for i in INKS]):
+        allowed=('source','proof','proof-raw','continuous','trap',*INKS,
+                 *[i+'-raw' for i in INKS],*[i+'-tone' for i in INKS])
+        if channel not in allowed:
             raise Invalid('通道无效')
         record,folder=store.result(key,request.args.get('result'))
-        return send_file(folder/(channel+'.png'),mimetype='image/png',max_age=0)
+        path=folder/(channel+'.png')
+        if not path.exists():
+            raise Invalid('该结果生成于陷印功能上线前，无此视图')
+        return send_file(path,mimetype='image/png',max_age=0)
 
     @api.get('/projects/<key>/report')
     def report(key):
