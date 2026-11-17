@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 from image_lab.validation import Invalid, Conflict
-from .core import decode,encode,settings
+from .core import decode,encode,settings,INKS
 
 
 def identifier():
@@ -44,9 +44,14 @@ class Store:
         items=[]
         for path in sorted(self.root.glob('*/project.json')):
             p=json.loads(path.read_text())
+            settings_value=p.get('settings') or {}
+            separation=settings_value.get('separation','cmyk')
+            inks=settings_value.get('spot_inks') or []
             items.append({'id':p['id'],'name':p['name'],'revision':p['revision'],
                           'source':p['source'],'versions':len(p['versions']),
-                          'current_result':p['current_result']})
+                          'current_result':p['current_result'],
+                          'separation':separation,
+                          'ink_names':[ink.get('name','') for ink in inks] if separation=='spot' else list(INKS)})
         return sorted(items,key=lambda p:p['name'])
 
     def create(self,name='新印刷作业'):

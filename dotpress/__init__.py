@@ -1,11 +1,10 @@
 import io
-import json
 import numpy as np
 from PIL import Image,ImageDraw
-from flask import Blueprint,request,jsonify,Response,send_file,render_template
+from flask import Blueprint,request,jsonify,send_file,render_template
 from image_lab.validation import Invalid
 from .store import Store
-from .core import render,encode,statistics,measurement,INKS
+from .core import render,encode,statistics,measurement,ink_channels
 from .delivery import export_plates,export_project,import_project
 
 
@@ -20,13 +19,20 @@ def install(app,root):
             raise Invalid('请求须为JSON对象')
         return value
 
+    def allowed_views(record):
+        views={'source','proof','continuous','error'}
+        for channel in ink_channels(record['settings']):
+            views.add(channel['key'])
+            views.add(channel['key']+'-tone')
+        return views
+
     @app.get('/')
     def home():
         return render_template('press.html')
 
     @api.get('/health')
     def health():
-        return jsonify({'ok':True,'product':'DotPress','version':'1.0'})
+        return jsonify({'ok':True,'product':'DotPress','version':'1.1'})
 
     @api.get('/projects')
     def listing():
@@ -64,9 +70,9 @@ def install(app,root):
 
     @api.get('/projects/<key>/result/<channel>.png')
     def result_image(key,channel):
-        if channel not in ('source','proof','continuous',*INKS,*[i+'-tone' for i in INKS]):
-            raise Invalid('通道无效')
         record,folder=store.result(key,request.args.get('result'))
+        if channel not in allowed_views(record):
+            raise Invalid('通道无效')
         return send_file(folder/(channel+'.png'),mimetype='image/png',max_age=0)
 
     @api.get('/projects/<key>/report')
@@ -106,6 +112,17 @@ def install(app,root):
         if file is None:
             raise Invalid('请选择DotPress工程')
         return jsonify(import_project(store,file.read())),201
+
+    @api.post('/projects/<key>/demo')
+    def spot_demo(key):
+        """Attach the synthetic poster and switch this job to a spot palette."""
+        p=store.read(key)
+        from .core import SPOT_PRESET
+        inks=[{'name':ink['name'],'color':ink['color']} for ink in SPOT_PRESET]
+        p=store.update(key,p['revision'],{'settings':{'separation':'spot','spot_inks':inks,
+                                                      'ink_limit':2.8,'width_mm':100,'height_mm':75,
+                                                      'dpi':96,'lpi':18}})
+        return jsonify(p)
 
     @api.post('/demo')
     def demo():
