@@ -5,7 +5,7 @@ from PIL import Image,ImageDraw
 from flask import Blueprint,request,jsonify,Response,send_file,render_template
 from image_lab.validation import Invalid
 from .store import Store
-from .core import render,encode,statistics,measurement,INKS
+from .core import render_page,encode,INKS
 from .delivery import export_plates,export_project,import_project
 
 
@@ -57,8 +57,7 @@ def install(app,root):
         data=body()
         captured,source=store.capture(key)
         store.revision(captured,data['revision'])
-        views,arrays=render(source,captured['settings'])
-        report=statistics(arrays,captured['settings'])
+        views,report,_=render_page(source,captured['settings'])
         record=store.publish(captured,views,report)
         return jsonify(record)
 
@@ -79,8 +78,7 @@ def install(app,root):
         d=body()
         p,source=store.capture(key)
         store.revision(p,d['revision'])
-        _,arrays=render(source,p['settings'])
-        result=measurement(arrays,d['rect'])
+        result=render_page(source,p['settings'],rect=d['rect'],views=False)[2]
         return jsonify(store.remember_measurement(key,d['revision'],result))
 
     @api.post('/projects/<key>/versions')

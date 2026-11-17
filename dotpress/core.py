@@ -1,7 +1,13 @@
-"""Raster plate preparation in physical page coordinates."""
+"""Raster plate preparation in physical page coordinates.
+
+Rendering streams the page in row bands.  Each band is addressed in the same
+absolute page coordinates (mm for the screen lattice, page pixels for
+registration) and reads the complete-page separation, so splitting a page
+never restarts a screen grid or drops a bilinear interpolation neighbour.
+Band sizes only bound transient buffers; they do not change the result.
+"""
 import io
 import math
-import hashlib
 import numpy as np
 from PIL import Image, ImageOps
 from scipy.ndimage import map_coordinates
@@ -17,6 +23,13 @@ DEFAULTS={
     'offset_y':[0.,0.,0.,0.],'enabled':[True,True,True,True],
     'crop':[0.,0.,1.,1.],'fit':'contain','screened':True,
 }
+# Page rows per screening band: bounds the plate/proof float temporaries.
+BAND_ROWS=64
+# Source pixels converted per resampling band: bounds the float source window.
+SOURCE_BAND_PIXELS=900_000
+# Ceiling on page rows per band so very wide pages stay bounded too.
+SOURCE_BAND_ROWS=192
+
 
 def finite(value,label,low,high):
     try:
@@ -108,31 +121,108 @@ def decode(raw):
         raise Invalid('无法解码源图') from error
 
 
-def source_canvas(source,p):
-    """Sample premultiplied linear color onto the physical page."""
-    w,h=pixel_size(p)
-    rgba=np.asarray(source,dtype=float)/255
-    sh,sw=rgba.shape[:2]
+def _rows(count):
+    for y0 in range(0,count,BAND_ROWS):
+        yield y0,min(count,y0+BAND_ROWS)
+
+
+def _source_window(coord,limit):
+    """Source pixels needed by one band's bilinear samples, plus a margin.
+
+    The window is clamped to the source but never empty, so bands that fall
+    entirely outside the photo still resample against the nearest edge exactly
+    as the complete-page sampler would.
+    """
+    lo=int(math.floor(float(np.min(coord))))-1
+    hi=int(math.floor(float(np.max(coord))))+2
+    lo=min(max(lo,0),limit-1)
+    hi=min(max(hi,lo+1),limit)
+    return lo,hi
+
+
+def _fit_scale(p,w,h,sw,sh):
+    """Scale and crop extent shared by the source sampler and band planner."""
     l,t,r,b=p['crop']
     cw,ch=(r-l)*sw,(b-t)*sh
-    yy,xx=np.mgrid[:h,:w].astype(float)
+    if p['fit']=='stretch':
+        return None,cw,ch
+    scale=min(w/cw,h/ch) if p['fit']=='contain' else max(w/cw,h/ch)
+    return scale,cw,ch
+
+
+def _fill_bands(p,sw,sh):
+    """Page row bands sized to keep the float source window bounded.
+
+    A band resamples the source columns its output width maps to and the source
+    rows its output rows map to, so the window size is derived from the fit
+    scale: heavy minification makes each page row cover many source rows and
+    therefore shortens the band.  Band choice never changes coordinates.
+    """
+    w,h=pixel_size(p)
+    scale,cw,ch=_fit_scale(p,w,h,sw,sh)
+    if scale is None:
+        columns=min(sw,cw+2.)
+        rows_per_row=max(1.,ch/h)
+    else:
+        columns=min(sw,max(w/cw,h/ch)/scale*w+2.)
+        rows_per_row=max(1.,1./scale)
+    budget=SOURCE_BAND_PIXELS/max(1.,columns*rows_per_row)
+    band=max(1,min(SOURCE_BAND_ROWS,h,int(budget)))
+    for y0 in range(0,h,band):
+        yield y0,min(h,y0+band)
+
+
+def source_canvas_band(source,p,y0,y1):
+    """Sample premultiplied linear colour for page rows [y0,y1).
+
+    The mapping, ``inside`` mask, paper compositing and ``srgb`` transform are
+    the complete-page ones evaluated on a row slice, so neighbouring bands are
+    continuous.  Only the source crop this band can touch is converted to
+    float, and source channels are converted one at a time.
+    """
+    w,h=pixel_size(p)
+    sh,sw=source.height,source.width
+    l,t,r,b=p['crop']
+    cw,ch=(r-l)*sw,(b-t)*sh
+    yy=np.arange(y0,y1,dtype=float)[:,None]
+    xx=np.arange(w,dtype=float)[None,:]
     if p['fit']=='stretch':
         sx=l*sw+(xx+.5)*cw/w-.5
         sy=t*sh+(yy+.5)*ch/h-.5
-        inside=np.ones((h,w),dtype=bool)
+        inside=np.ones((y1-y0,w),dtype=bool)
     else:
         scale=min(w/cw,h/ch) if p['fit']=='contain' else max(w/cw,h/ch)
         sx=l*sw+((xx+.5-w/2)/scale+cw/2)-.5
         sy=t*sh+((yy+.5-h/2)/scale+ch/2)-.5
         inside=(sx>=l*sw-.5)&(sx<r*sw-.5)&(sy>=t*sh-.5)&(sy<b*sh-.5)
-    alpha=rgba[:,:,3]
-    sampled_alpha=map_coordinates(alpha,[sy,sx],order=1,mode='nearest')*inside
-    premult=linear(rgba[:,:,:3])*alpha[:,:,None]
-    sampled=np.stack([map_coordinates(premult[:,:,c],[sy,sx],order=1,mode='nearest') for c in range(3)],2)
+    c0,c1=_source_window(sx,sw)
+    r0,r1=_source_window(sy,sh)
+    crop=np.asarray(source.crop((c0,r0,c1,r1)))
+    alpha=np.asarray(crop[:,:,3],dtype=float)/255
+    coords=np.broadcast_arrays(sy-r0,sx-c0)
+    sampled_alpha=map_coordinates(alpha,coords,order=1,mode='nearest')*inside
+    sampled=np.empty((y1-y0,w,3),dtype=float)
+    for c in range(3):
+        channel=np.asarray(crop[:,:,c],dtype=float)/255
+        premult=linear(channel)*alpha
+        del channel
+        sampled[:,:,c]=map_coordinates(premult,coords,order=1,mode='nearest')
+        del premult
+    del alpha,crop
     sampled*=inside[:,:,None]
     paper=linear(parse_color(p['paper']))
-    composed=sampled+paper*(1-sampled_alpha[:,:,None])
-    return srgb(composed),sampled_alpha
+    sampled+=(paper*(1-sampled_alpha[:,:,None]))
+    return srgb(sampled),sampled_alpha
+
+
+def source_canvas(source,p):
+    """Sample premultiplied linear colour onto the physical page."""
+    w,h=pixel_size(p)
+    sh,sw=source.height,source.width
+    parts=[source_canvas_band(source,p,y0,y1) for y0,y1 in _fill_bands(p,sw,sh)]
+    rgb=np.concatenate([part[0] for part in parts],axis=0)
+    alpha=np.concatenate([part[1] for part in parts],axis=0)
+    return rgb,alpha
 
 
 def tone_rgb(rgb,p):
@@ -172,25 +262,39 @@ def lattice_rank(x,y,angle,lpi,phase_x,phase_y):
     return np.where(d<=.5,2*d*d,1-2*(1-d)**2)
 
 
-def screen_plates(cmyk,p,origin=(0,0)):
-    h,w=cmyk.shape[:2]
-    yy,xx=np.mgrid[:h,:w].astype(float)
-    x=(xx+.5+origin[0])*25.4/p['dpi']
-    y=(yy+.5+origin[1])*25.4/p['dpi']
+def screen_band(cmyk,y0,y1,p,row0=0,origin=(0,0)):
+    """Screen page rows [y0,y1) from a nominal-ink array.
+
+    ``cmyk`` holds page rows starting at ``row0``; ``origin`` shifts the
+    physical page origin in pixels.  Coordinates are absolute page
+    coordinates, and ``mode='constant'`` applies at the page edge, so the
+    result does not depend on where a band starts or ends.
+    """
+    w=cmyk.shape[1]
+    yy=np.arange(y0,y1,dtype=float)[:,None]
+    xx=np.arange(w,dtype=float)[None,:]
+    yy,xx=np.broadcast_arrays(yy,xx)
     out=[]
     for i in range(4):
         shiftx=p['offset_x'][i]
         shifty=p['offset_y'][i]
-        coords=[yy-shifty*p['dpi']/25.4,xx-shiftx*p['dpi']/25.4]
+        coords=[yy-row0-shifty*p['dpi']/25.4,xx-shiftx*p['dpi']/25.4]
         coverage=map_coordinates(cmyk[:,:,i],coords,order=1,mode='constant',cval=0)
         effective=dot_gain(coverage,p['gain'])
         if p['screened']:
+            x=(xx+.5+origin[0])*25.4/p['dpi']
+            y=(yy+.5+origin[1])*25.4/p['dpi']
             rank=lattice_rank(x-shiftx,y-shifty,p['angles'][i],p['lpi'],p['phase_x'][i],p['phase_y'][i])
             plate=(effective>=rank).astype(float)
         else:
             plate=effective
         out.append(plate)
     return np.stack(out,axis=2)
+
+
+def screen_plates(cmyk,p,origin=(0,0)):
+    h,w=cmyk.shape[:2]
+    return np.concatenate([screen_band(cmyk,y0,y1,p,origin=origin) for y0,y1 in _rows(h)],axis=0)
 
 
 def proof(plates,p):
@@ -203,20 +307,108 @@ def proof(plates,p):
     return srgb(paper*np.exp(density))
 
 
+def _uint8(array):
+    """Quantise a unit-float page array to the 8-bit channel PNG encoding."""
+    return np.rint(np.clip(array,0,1)*255).astype('uint8')
+
+
 def image(array):
-    return Image.fromarray(np.rint(np.clip(array,0,1)*255).astype('uint8'))
+    return Image.fromarray(_uint8(array))
+
+
+def _region(rect,w,h):
+    if not isinstance(rect,list) or len(rect)!=4:
+        raise Invalid('测量区域须为四项归一化坐标')
+    l,t,r,b=[finite(v,'测量区域',0,1) for v in rect]
+    if not l<r or not t<b:
+        raise Invalid('测量区域为空')
+    return l,t,r,b,max(0,int(l*w)),max(0,int(t*h)),min(w,math.ceil(r*w)),min(h,math.ceil(b*h))
+
+
+def _views(p):
+    w,h=pixel_size(p)
+    buffers={'source':np.empty((h,w,3),dtype='uint8'),
+             'proof':np.empty((h,w,3),dtype='uint8'),
+             'continuous':np.empty((h,w,3),dtype='uint8')}
+    for name in INKS:
+        buffers[name]=np.empty((h,w),dtype='uint8')
+        buffers[name+'-tone']=np.empty((h,w),dtype='uint8')
+    return buffers
+
+
+def render_page(source,p,rect=None,views=True):
+    """Render one complete page as streaming bands.
+
+    Returns ``(views, report, measurement)``.  ``views`` maps each deliverable
+    channel to a PIL image, ``report`` is the whole-page coverage report and
+    ``measurement`` is the optional region measurement.
+
+    Source resampling, separation, screening, both proofs and PNG encoding all
+    advance in row bands, so no full-resolution proof, intermediate colour or
+    premultiplied source stack is ever alive.  The nominal-ink page and its
+    screened plates are the only full-page float arrays; the report and region
+    measurement reduce them with the same whole-page operations an undivided
+    render uses, so all three outputs describe the same complete render.
+    """
+    p=settings(p)
+    w,h=pixel_size(p)
+    sh,sw=source.height,source.width
+    cmyk=np.empty((h,w,4),dtype=float)
+    buffers=_views(p) if views else None
+    for y0,y1 in _fill_bands(p,sw,sh):
+        rgb,alpha=source_canvas_band(source,p,y0,y1)
+        cmyk[y0:y1]=separate(rgb,p)
+        if buffers is not None:
+            buffers['source'][y0:y1]=_uint8(rgb)
+        del rgb,alpha
+    plates=np.empty((h,w,4),dtype=float)
+    for y0,y1 in _rows(h):
+        band=screen_band(cmyk,y0,y1,p)
+        plates[y0:y1]=band
+        if buffers is not None:
+            buffers['proof'][y0:y1]=_uint8(proof(band,p))
+            buffers['continuous'][y0:y1]=_uint8(proof(cmyk[y0:y1],p))
+            for i,name in enumerate(INKS):
+                buffers[name][y0:y1]=_uint8(1-band[:,:,i])
+                buffers[name+'-tone'][y0:y1]=_uint8(1-cmyk[y0:y1,:,i])
+        del band
+    arrays={'nominal':cmyk,'plates':plates}
+    report=statistics(arrays,p)
+    measure=measurement(arrays,rect) if rect is not None else None
+    result={name:Image.fromarray(array) for name,array in buffers.items()} if buffers is not None else None
+    return result,report,measure
 
 
 def render(source,p):
+    """Compatibility path that also returns the full nominal/plate arrays.
+
+    Source resampling, separation, screening and view encoding all stream in
+    bands, so the only full-page buffers are the arrays this signature
+    promises to return.  Production endpoints use :func:`render_page`.
+    """
     p=settings(p)
-    rgb,alpha=source_canvas(source,p)
-    cmyk=separate(rgb,p)
-    plates=screen_plates(cmyk,p)
-    views={'source':image(rgb),'proof':image(proof(plates,p)),'continuous':image(proof(cmyk,p))}
-    for i,name in enumerate(INKS):
-        views[name]=image(1-plates[:,:,i])
-        views[name+'-tone']=image(1-cmyk[:,:,i])
-    return views,{'nominal':cmyk,'plates':plates,'alpha':alpha}
+    w,h=pixel_size(p)
+    sh,sw=source.height,source.width
+    cmyk=np.empty((h,w,4),dtype=float)
+    alpha=np.empty((h,w),dtype=float)
+    views=_views(p)
+    for y0,y1 in _fill_bands(p,sw,sh):
+        rgb,a=source_canvas_band(source,p,y0,y1)
+        cmyk[y0:y1]=separate(rgb,p)
+        alpha[y0:y1]=a
+        views['source'][y0:y1]=_uint8(rgb)
+        del rgb,a
+    plates=np.empty((h,w,4),dtype=float)
+    for x0,x1 in _rows(h):
+        band=screen_band(cmyk,x0,x1,p)
+        plates[x0:x1]=band
+        views['proof'][x0:x1]=_uint8(proof(band,p))
+        views['continuous'][x0:x1]=_uint8(proof(cmyk[x0:x1],p))
+        for i,name in enumerate(INKS):
+            views[name][x0:x1]=_uint8(1-band[:,:,i])
+            views[name+'-tone'][x0:x1]=_uint8(1-cmyk[x0:x1,:,i])
+        del band
+    return {name:Image.fromarray(array) for name,array in views.items()},{'nominal':cmyk,'plates':plates,'alpha':alpha}
 
 
 def statistics(arrays,p):
@@ -238,14 +430,7 @@ def statistics(arrays,p):
 
 
 def measurement(arrays,rect):
-    if not isinstance(rect,list) or len(rect)!=4:
-        raise Invalid('测量区域须为四项归一化坐标')
-    l,t,r,b=[finite(v,'测量区域',0,1) for v in rect]
-    if not l<r or not t<b:
-        raise Invalid('测量区域为空')
-    h,w=arrays['nominal'].shape[:2]
-    x0,x1=max(0,int(l*w)),min(w,math.ceil(r*w))
-    y0,y1=max(0,int(t*h)),min(h,math.ceil(b*h))
+    l,t,r,b,x0,y0,x1,y1=_region(rect,arrays['nominal'].shape[1],arrays['nominal'].shape[0])
     nominal=arrays['nominal'][y0:y1,x0:x1]
     plates=arrays['plates'][y0:y1,x0:x1]
     return {'rect':[l,t,r,b],'pixel_rect':[x0,y0,x1,y1],
