@@ -8,6 +8,12 @@ from scipy.ndimage import map_coordinates
 from image_lab.validation import Invalid
 
 INKS=('C','M','Y','K')
+# Fixed fallback transmittances (reflectance fraction per sRGB channel).
+# Used for unmeasured inks and whenever calibration is disabled.
+BASE_ABSORB=np.array([[.04,.83,.88],[.84,.06,.80],[.80,.84,.03],[.08,.08,.08]])
+PAIRS=(('C','M'),('C','Y'),('C','K'),('M','Y'),('M','K'),('Y','K'))
+REFLECT_EPS=1e-4
+RESIDUAL_LIMIT=3.
 DEFAULTS={
     'width_mm':100.,'height_mm':75.,'dpi':96.,'lpi':18.,
     'black':.7,'ink_limit':2.8,'gamma':1.,'saturation':1.,
@@ -55,6 +61,7 @@ def settings(raw=None):
     if p['fit'] not in ('contain','cover','stretch'):
         raise Invalid('适配方式无效')
     p['screened']=bool(p['screened'])
+    p['calibration']=validate_calibration(p.get('calibration'))
     w,h=pixel_size(p)
     if max(w,h)>1200 or w*h>1200**2:
         raise Invalid('当前页面像素预算为1200×1200，请降低DPI或尺寸')
@@ -68,13 +75,107 @@ def pixel_size(p):
             max(1,round(p['height_mm']/25.4*p['dpi'])))
 
 
-def parse_color(text):
+def hex_rgb(text,label='颜色'):
     if not isinstance(text,str) or len(text)!=7 or text[0]!='#':
-        raise Invalid('纸色须为#RRGGBB')
+        raise Invalid(label+'须为#RRGGBB')
     try:
-        return np.array([int(text[i:i+2],16) for i in (1,3,5)],dtype=float)/255
+        return tuple(int(text[i:i+2],16) for i in (1,3,5))
     except ValueError as error:
-        raise Invalid('纸色无效') from error
+        raise Invalid(label+'无效') from error
+
+
+def parse_color(text):
+    return np.array(hex_rgb(text,'纸色'),dtype=float)/255
+
+
+def default_calibration(paper=None):
+    """Seed values from the fixed transmittance model on the current paper."""
+    paper_linear=linear(parse_color(paper or DEFAULTS['paper']))
+    paper_hex='#%02x%02x%02x'%tuple(int(round(v*255)) for v in srgb(paper_linear))
+    patches={}
+    for i,ink in enumerate(INKS):
+        solid=np.clip(paper_linear*BASE_ABSORB[i],0,1)
+        patches[ink]={'rgb':'#%02x%02x%02x'%tuple(int(round(v*255)) for v in srgb(solid)),
+                      'measured':False}
+    for a,b in PAIRS:
+        trans=BASE_ABSORB[INKS.index(a)]*BASE_ABSORB[INKS.index(b)]
+        solid=np.clip(paper_linear*trans,0,1)
+        patches[a+b]={'rgb':'#%02x%02x%02x'%tuple(int(round(v*255)) for v in srgb(solid)),
+                      'measured':False}
+    return {'enabled':False,'paper':{'rgb':paper_hex,'measured':False},'patches':patches,
+            'note':'未实测色块由固定透射率与独立叠印乘积近似；不是ICC合同打样。'}
+
+
+def validate_calibration(raw):
+    if raw is None:
+        return default_calibration()
+    if not isinstance(raw,dict):
+        raise Invalid('软打样校准须为对象')
+    cal=default_calibration(raw.get('paper',{}).get('rgb')
+                           if isinstance(raw.get('paper'),dict) else None)
+    cal['enabled']=bool(raw.get('enabled',False))
+    paper=raw.get('paper')
+    if isinstance(paper,dict):
+        hex_rgb(paper.get('rgb'),'纸白实测')
+        cal['paper']={'rgb':paper['rgb'].lower(),'measured':bool(paper.get('measured'))}
+    patches=raw.get('patches')
+    if not isinstance(patches,dict):
+        raise Invalid('校准色块须为对象')
+    keys=(*INKS,*(a+b for a,b in PAIRS))
+    if any(k not in patches for k in keys):
+        raise Invalid('校准色块不完整')
+    for key in keys:
+        item=patches[key]
+        if not isinstance(item,dict):
+            raise Invalid('校准色块须为对象')
+        hex_rgb(item.get('rgb'),'校准色块')
+        cal['patches'][key]={'rgb':item['rgb'].lower(),'measured':bool(item.get('measured'))}
+    if not isinstance(raw.get('note',''),str) or len(raw.get('note',''))>300:
+        raise Invalid('校准说明过长')
+    cal['note']=str(raw.get('note',cal['note']))[:300]
+    return cal
+
+
+def build_proof_model(cal,fallback_paper):
+    """Linear-light densities from measured patches; gaps stay on the fixed model.
+
+    Returns paper reflectance, per-ink density (4x3) and pairwise residual
+    density (6x3) so that paper*exp(-(density sums + residuals)) reproduces the
+    measured solids and overprints. Approximations only fill missing inputs.
+    """
+    paper=linear(parse_color(cal['paper']['rgb'])) if cal['paper']['measured'] \
+        else fallback_paper
+    ink_density=np.zeros((4,3))
+    for i,ink in enumerate(INKS):
+        item=cal['patches'][ink]
+        if item['measured']:
+            refl=np.clip(linear(parse_color(item['rgb'])),REFLECT_EPS,np.maximum(paper,REFLECT_EPS))
+            ink_density[i]=np.log(np.clip(paper/refl,1.,1/REFLECT_EPS))
+        else:
+            ink_density[i]=-np.log(np.clip(BASE_ABSORB[i],REFLECT_EPS,1))
+    pair_residual=np.zeros((6,3))
+    for j,(a,b) in enumerate(PAIRS):
+        item=cal['patches'][a+b]
+        if item['measured']:
+            refl=np.clip(linear(parse_color(item['rgb'])),REFLECT_EPS,np.maximum(paper,REFLECT_EPS))
+            observed=np.log(np.clip(paper/refl,1.,1/REFLECT_EPS))
+            residual=observed-ink_density[INKS.index(a)]-ink_density[INKS.index(b)]
+            pair_residual[j]=np.clip(residual,-RESIDUAL_LIMIT,RESIDUAL_LIMIT)
+    return paper,ink_density,pair_residual
+
+
+def calibration_summary(p):
+    """Persistent description of which patches were measured vs approximated."""
+    cal=p.get('calibration') or default_calibration(p.get('paper'))
+    keys=('paper',*INKS,*(a+b for a,b in PAIRS))
+    measured,approx=[],[]
+    for key in keys:
+        node=cal['paper'] if key=='paper' else cal['patches'][key]
+        (measured if node.get('measured') else approx).append(key)
+    return {'enabled':bool(cal.get('enabled')),'measured':measured,'approximated':approx,
+            'method':'实测色块反推线性光密度，叠印残差成对校正；缺测项用固定透射率乘积近似',
+            'disclaimer':'经验色块近似，不是ICC认证或合同打样',
+            'note':cal.get('note','')}
 
 
 def linear(a):
@@ -194,13 +295,24 @@ def screen_plates(cmyk,p,origin=(0,0)):
 
 
 def proof(plates,p):
-    """Approximate subtractive RGB proof; no measured press profile claim."""
-    paper=linear(parse_color(p['paper']))
-    absorb=np.array([[.04,.83,.88],[.84,.06,.80],[.80,.84,.03],[.08,.08,.08]])
-    trans=np.clip(absorb,1e-4,1)
-    logt=np.log(trans)
-    density=np.einsum('hwi,ic->hwc',plates,logt)*p['proof_density']
-    return srgb(paper*np.exp(density))
+    """Approximate subtractive RGB proof calibrated from measured color patches.
+
+    Calibration only changes this view: separations, nominal ink amounts and
+    screened plates are computed independently and never altered here. With no
+    measured patches the result is the fixed transmittance product model.
+    """
+    paper_setting=linear(parse_color(p['paper']))
+    cal=p.get('calibration') or default_calibration(p['paper'])
+    if not cal.get('enabled'):
+        trans=np.clip(BASE_ABSORB,1e-4,1)
+        density=np.einsum('hwi,ic->hwc',plates,np.log(trans))*p['proof_density']
+        return srgb(paper_setting*np.exp(density))
+    paper,ink_density,pair_residual=build_proof_model(cal,paper_setting)
+    density=np.einsum('hwi,ic->hwc',plates,ink_density)
+    for j,(a,b) in enumerate(PAIRS):
+        ia,ib=INKS.index(a),INKS.index(b)
+        density+=(plates[:,:,ia]*plates[:,:,ib])[:,:,None]*pair_residual[j]
+    return srgb(np.clip(paper*np.exp(-np.maximum(density,0)),0,1))
 
 
 def image(array):
@@ -227,7 +339,7 @@ def statistics(arrays,p):
             'dpi':p['dpi'],'lpi':p['lpi'],'pixels_per_cell':p['dpi']/p['lpi'],
             'total_ink_max':float(cmyk.sum(axis=2).max()),
             'total_ink_mean':float(cmyk.sum(axis=2).mean()),
-            'channels':{}}
+            'proof_calibration':calibration_summary(p),'channels':{}}
     for i,name in enumerate(INKS):
         tone=cmyk[:,:,i]
         plate=plates[:,:,i]
