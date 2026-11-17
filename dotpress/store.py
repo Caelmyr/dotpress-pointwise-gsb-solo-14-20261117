@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from image_lab.validation import Invalid, Conflict
 from .core import decode,encode,settings
+from . import calibration
 
 
 def identifier():
@@ -30,7 +31,9 @@ class Store:
         path=self.directory(key)/'project.json'
         if not path.exists():
             raise Invalid('工程不存在')
-        return json.loads(path.read_text())
+        p=json.loads(path.read_text())
+        p.setdefault('calibration',calibration.default())
+        return p
 
     def write(self,p):
         directory=self.directory(p['id'])
@@ -53,7 +56,7 @@ class Store:
         with self.lock:
             p={'id':identifier(),'name':str(name)[:100],'revision':1,'created':time.time(),
                'source':None,'settings':settings(),'versions':[],'results':[],
-               'current_result':None,'measurements':[]}
+               'current_result':None,'measurements':[],'calibration':calibration.default()}
             self.write(p)
             return p
 
@@ -67,6 +70,8 @@ class Store:
             self.revision(p,expected)
             if 'settings' in data:
                 p['settings']=settings({**p['settings'],**data['settings']})
+            if 'calibration' in data:
+                p['calibration']=calibration.validate(data['calibration'])
             if 'name' in data:
                 p['name']=str(data['name'])[:100]
             p['revision']+=1
@@ -108,7 +113,8 @@ class Store:
             if len(p['versions'])>=20:
                 raise Invalid('每工程最多20个命名版本')
             p['versions'].append({'id':identifier(),'label':str(label)[:80],
-                                  'source':p['source'],'settings':copy.deepcopy(p['settings'])})
+                                  'source':p['source'],'settings':copy.deepcopy(p['settings']),
+                                  'calibration':copy.deepcopy(p['calibration'])})
             p['revision']+=1
             self.write(p)
             return p
@@ -122,6 +128,7 @@ class Store:
                 raise Invalid('版本不存在')
             p['source']=version['source']
             p['settings']=settings(version['settings'])
+            p['calibration']=calibration.validate(version.get('calibration'))
             p['revision']+=1
             p['current_result']=None
             self.write(p)
@@ -138,7 +145,8 @@ class Store:
             for name,pic in views.items():
                 (folder/(name+'.png')).write_bytes(encode(pic))
             record={'id':rid,'revision':captured['revision'],'source':captured['source'],
-                    'settings':captured['settings'],'report':report,'created':time.time()}
+                    'settings':captured['settings'],'report':report,'created':time.time(),
+                    'calibration':calibration.snapshot(captured.get('calibration'))}
             (folder/'result.json').write_text(json.dumps(record,ensure_ascii=False,indent=2))
             current['results'].append(record)
             current['current_result']=rid

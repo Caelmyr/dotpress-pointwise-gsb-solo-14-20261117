@@ -7,6 +7,7 @@ from image_lab.validation import Invalid
 from .store import Store
 from .core import render,encode,statistics,measurement,INKS
 from .delivery import export_plates,export_project,import_project
+from . import calibration
 
 
 def install(app,root):
@@ -57,8 +58,8 @@ def install(app,root):
         data=body()
         captured,source=store.capture(key)
         store.revision(captured,data['revision'])
-        views,arrays=render(source,captured['settings'])
-        report=statistics(arrays,captured['settings'])
+        views,arrays=render(source,captured['settings'],captured.get('calibration'))
+        report=statistics(arrays,captured['settings'],captured.get('calibration'))
         record=store.publish(captured,views,report)
         return jsonify(record)
 
@@ -79,9 +80,13 @@ def install(app,root):
         d=body()
         p,source=store.capture(key)
         store.revision(p,d['revision'])
-        _,arrays=render(source,p['settings'])
+        _,arrays=render(source,p['settings'],p.get('calibration'))
         result=measurement(arrays,d['rect'])
         return jsonify(store.remember_measurement(key,d['revision'],result))
+
+    @api.post('/calibration/derive')
+    def derive_calibration():
+        return jsonify(calibration.derive(body().get('calibration')))
 
     @api.post('/projects/<key>/versions')
     def version(key):

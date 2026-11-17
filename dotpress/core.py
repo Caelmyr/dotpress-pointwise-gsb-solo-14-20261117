@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from scipy.ndimage import map_coordinates
 from image_lab.validation import Invalid
+from .calibration import compensate, summary as calibration_summary
 
 INKS=('C','M','Y','K')
 DEFAULTS={
@@ -141,6 +142,13 @@ def tone_rgb(rgb,p):
     return np.clip(srgb(adjusted)**p['gamma'],0,1)
 
 
+def enforce_total(cmyk, limit):
+    """Proportionally scale each pixel so total ink never exceeds the limit."""
+    amount = cmyk.sum(axis=2)
+    scale = np.minimum(1, limit / np.maximum(amount, 1e-12))
+    return np.clip(cmyk * scale[:, :, None], 0, 1)
+
+
 def separate(rgb,p):
     """Simple subtractive GCR, with bounded total nominal ink."""
     rgb=tone_rgb(rgb,p)
@@ -148,9 +156,7 @@ def separate(rgb,p):
     k=np.min(raw,axis=2)*p['black']
     chroma=np.maximum(raw-k[:,:,None],0)
     cmyk=np.concatenate([chroma,k[:,:,None]],axis=2)
-    amount=cmyk.sum(axis=2)
-    scale=np.minimum(1,p['ink_limit']/np.maximum(amount,1e-12))
-    cmyk*=scale[:,:,None]
+    cmyk=enforce_total(cmyk,p['ink_limit'])
     cmyk*=np.asarray(p['enabled'],dtype=float)
     return np.clip(cmyk,0,1)
 
@@ -207,33 +213,41 @@ def image(array):
     return Image.fromarray(np.rint(np.clip(array,0,1)*255).astype('uint8'))
 
 
-def render(source,p):
+def render(source,p,calibration=None):
     p=settings(p)
     rgb,alpha=source_canvas(source,p)
     cmyk=separate(rgb,p)
-    plates=screen_plates(cmyk,p)
-    views={'source':image(rgb),'proof':image(proof(plates,p)),'continuous':image(proof(cmyk,p))}
+    sent=enforce_total(compensate(cmyk,calibration),p['ink_limit'])
+    plates=screen_plates(sent,p)
+    views={'source':image(rgb),'proof':image(proof(plates,p)),'continuous':image(proof(sent,p))}
     for i,name in enumerate(INKS):
         views[name]=image(1-plates[:,:,i])
-        views[name+'-tone']=image(1-cmyk[:,:,i])
-    return views,{'nominal':cmyk,'plates':plates,'alpha':alpha}
+        views[name+'-tone']=image(1-sent[:,:,i])
+    return views,{'nominal':cmyk,'sent':sent,'plates':plates,'alpha':alpha}
 
 
-def statistics(arrays,p):
-    cmyk=arrays['nominal']
+def statistics(arrays,p,calibration=None):
+    nominal=arrays['nominal']
+    sent=arrays['sent']
     plates=arrays['plates']
     w,h=pixel_size(p)
     report={'size':[w,h],'millimeters':[p['width_mm'],p['height_mm']],
             'dpi':p['dpi'],'lpi':p['lpi'],'pixels_per_cell':p['dpi']/p['lpi'],
-            'total_ink_max':float(cmyk.sum(axis=2).max()),
-            'total_ink_mean':float(cmyk.sum(axis=2).mean()),
+            'total_ink_max':float(sent.sum(axis=2).max()),
+            'total_ink_mean':float(sent.sum(axis=2).mean()),
             'channels':{}}
     for i,name in enumerate(INKS):
-        tone=cmyk[:,:,i]
+        tone=sent[:,:,i]
         plate=plates[:,:,i]
         report['channels'][name]={'mean_tone':float(tone.mean()),'area_coverage':float(plate.mean()),
                                  'min':float(tone.min()),'max':float(tone.max()),
                                  'histogram':np.histogram(tone,bins=16,range=(0,1))[0].tolist()}
+    if calibration and calibration.get('enabled'):
+        report['nominal_total_max']=float(nominal.sum(axis=2).max())
+        report['nominal_total_mean']=float(nominal.sum(axis=2).mean())
+        for i,name in enumerate(INKS):
+            report['channels'][name]['nominal_mean']=float(nominal[:,:,i].mean())
+        report['calibration']=calibration_summary(calibration)
     return report
 
 
@@ -247,7 +261,9 @@ def measurement(arrays,rect):
     x0,x1=max(0,int(l*w)),min(w,math.ceil(r*w))
     y0,y1=max(0,int(t*h)),min(h,math.ceil(b*h))
     nominal=arrays['nominal'][y0:y1,x0:x1]
+    sent=arrays['sent'][y0:y1,x0:x1]
     plates=arrays['plates'][y0:y1,x0:x1]
     return {'rect':[l,t,r,b],'pixel_rect':[x0,y0,x1,y1],
             'nominal_mean':nominal.mean(axis=(0,1)).tolist(),
+            'sent_mean':sent.mean(axis=(0,1)).tolist(),
             'coverage':plates.mean(axis=(0,1)).tolist(),'pixel_count':int(nominal.shape[0]*nominal.shape[1])}

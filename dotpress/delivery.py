@@ -5,6 +5,7 @@ import hashlib
 import zipfile
 from image_lab.validation import Invalid
 from .core import INKS,encode,decode,settings
+from . import calibration
 
 
 def export_plates(store,key,rid=None):
@@ -14,12 +15,17 @@ def export_plates(store,key,rid=None):
         for name in (*INKS,'proof','continuous','source'):
             z.writestr(name+'.png',(folder/(name+'.png')).read_bytes())
         manifest={'format':'dotpress-plates-1','result':record,
+                  'calibration':record.get('calibration'),
                   'plate_convention':'black=ink, white=paper; separate grayscale C M Y K',
                   'proof':'approximate subtractive RGB simulation, not an ICC press contract proof',
                   'coordinates':'physical page top-left, mm; positive x right and y down',
                   'pixel_centers':'(column+.5,row+.5)*25.4/dpi'}
         z.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
-        z.writestr('README.txt','DotPress合成演示。四独立灰度印版与RGB软打样。尺寸/DPI/网线和原输入修订见manifest。\n')
+        cal=record.get('calibration') or {}
+        note='校准：未启用（恒等送墨）'
+        if cal.get('enabled'):
+            note=f"校准：{cal.get('label') or '未命名'} / 指纹 {cal.get('fingerprint')}（各版测量与整理曲线见manifest）"
+        z.writestr('README.txt','DotPress合成演示。四独立灰度印版与RGB软打样。尺寸/DPI/网线和原输入修订见manifest。'+note+'\n')
     return stream.getvalue()
 
 
@@ -48,11 +54,13 @@ def import_project(store,raw):
                 raise Invalid('工程包文件名无效')
             p=json.loads(z.read('project.json'))
             ps=settings(p['settings'])
+            cal=calibration.validate(p.get('calibration'))
             versions=p.get('versions',[])
             if not isinstance(versions,list) or len(versions)>20:
                 raise Invalid('版本列表无效')
             for v in versions:
                 settings(v['settings'])
+                calibration.validate(v.get('calibration'))
             closure={p.get('source')}|{v.get('source') for v in versions}
             assets={}
             for source in closure-{None}:
@@ -72,7 +80,9 @@ def import_project(store,raw):
             rekey[source]=new
         q['source']=rekey.get(p.get('source'))
         q['settings']=ps
-        q['versions']=[{**v,'source':rekey.get(v.get('source')),'settings':settings(v['settings'])} for v in versions]
+        q['calibration']=cal
+        q['versions']=[{**v,'source':rekey.get(v.get('source')),'settings':settings(v['settings']),
+                        'calibration':calibration.validate(v.get('calibration'))} for v in versions]
         q['measurements']=[]
         q['revision']+=1
         store.write(q)
