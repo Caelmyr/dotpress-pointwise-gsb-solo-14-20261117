@@ -1,12 +1,14 @@
 import io
 import json
+import math
 import numpy as np
 from PIL import Image,ImageDraw
 from flask import Blueprint,request,jsonify,Response,send_file,render_template
-from image_lab.validation import Invalid
+from image_lab.validation import Invalid, Conflict
 from .store import Store
 from .core import render,encode,statistics,measurement,INKS
 from .delivery import export_plates,export_project,import_project
+from .diagnosis import diagnose,preview,fingerprint
 
 
 def install(app,root):
@@ -82,6 +84,59 @@ def install(app,root):
         _,arrays=render(source,p['settings'])
         result=measurement(arrays,d['rect'])
         return jsonify(store.remember_measurement(key,d['revision'],result))
+
+    @api.post('/projects/<key>/diagnose')
+    def diagnose_report(key):
+        d=body()
+        captured,source=store.capture(key)
+        store.revision(captured,d['revision'])
+        report=diagnose(source,captured['settings'],d.get('rect'))
+        report['project']=key
+        report['revision']=captured['revision']
+        report['input_fingerprint']=fingerprint(captured['source'],captured['settings'])
+        return jsonify(report)
+
+    @api.get('/projects/<key>/diagnose/preview.png')
+    def diagnose_preview(key):
+        def list_arg(name,aliases=()):
+            values=[v for v in request.args.getlist(name,type=float) if v is not None]
+            for alias in aliases:
+                values.extend(v for v in request.args.getlist(alias,type=float) if v is not None)
+            if not values:
+                raw=request.args.get(name,'') or request.args.get(next(iter(aliases),''),'')
+                try:
+                    values=[float(v) for v in raw.split(',') if v!='']
+                except ValueError as error:
+                    raise Invalid(name+'参数须为数字') from error
+            if any(not math.isfinite(v) for v in values):
+                raise Invalid(name+'参数须为有限数字')
+            return values
+        revision=request.args.get('revision',type=int)
+        rect=list_arg('rect')
+        angles=list_arg('angle',('angles',))
+        view=request.args.get('view','proof')
+        if len(rect)!=4 or len(angles)!=4:
+            raise Invalid('预览需要四项区域和四项网角')
+        captured,source=store.capture(key)
+        store.revision(captured,revision)
+        png=preview(source,captured['settings'],rect,angles,view)
+        return send_file(io.BytesIO(png),mimetype='image/png',max_age=0)
+
+    @api.post('/projects/<key>/diagnose/apply')
+    def diagnose_apply(key):
+        d=body()
+        captured,_=store.capture(key)
+        store.revision(captured,d['revision'])
+        expected_fp=fingerprint(captured['source'],captured['settings'])
+        if d.get('input_fingerprint')!=expected_fp:
+            raise Conflict('诊断输入已变化（源图或设置改动），请重新诊断后再应用')
+        angles=d.get('angles')
+        if not isinstance(angles,list) or len(angles)!=4:
+            raise Invalid('请选择一组四通道网角')
+        advice={'label':d.get('label','网花诊断推荐'),
+                'input_fingerprint':expected_fp}
+        p=store.apply_angles(key,d['revision'],angles,advice)
+        return jsonify(p)
 
     @api.post('/projects/<key>/versions')
     def version(key):

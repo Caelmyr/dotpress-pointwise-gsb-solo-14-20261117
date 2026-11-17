@@ -73,6 +73,10 @@ def import_project(store,raw):
         q['source']=rekey.get(p.get('source'))
         q['settings']=ps
         q['versions']=[{**v,'source':rekey.get(v.get('source')),'settings':settings(v['settings'])} for v in versions]
+        advice=p.get('angle_advice',[])
+        if not isinstance(advice,list) or len(advice)>20:
+            advice=[]
+        q['angle_advice']=advice
         q['measurements']=[]
         q['revision']+=1
         store.write(q)

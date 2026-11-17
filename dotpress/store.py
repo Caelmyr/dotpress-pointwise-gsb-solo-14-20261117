@@ -153,6 +153,26 @@ class Store:
             raise Invalid('请先生成印版')
         return record,self.directory(key)/rid
 
+    def apply_angles(self,key,expected,angles,advice):
+        """Write back a confirmed angle set; manual angle entry stays untouched."""
+        with self.lock:
+            p=self.read(key)
+            self.revision(p,expected)
+            if not isinstance(angles,list) or len(angles)!=4:
+                raise Invalid('网角须为四项数组')
+            p['settings']=settings({**p['settings'],'angles':[float(a) for a in angles]})
+            p.setdefault('angle_advice',[])
+            p['angle_advice'].append({'id':identifier(),'time':time.time(),
+                                      'label':str(advice.get('label','网花诊断推荐'))[:80],
+                                      'revision_before':expected,
+                                      'input_fingerprint':advice.get('input_fingerprint'),
+                                      'angles':[round(float(a),3) for a in angles]})
+            p['angle_advice']=p['angle_advice'][-20:]
+            p['revision']+=1
+            p['current_result']=None
+            self.write(p)
+            return p
+
     def remember_measurement(self,key,expected,record):
         with self.lock:
             p=self.read(key)
